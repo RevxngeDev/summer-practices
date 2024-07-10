@@ -49,6 +49,17 @@ function sendMessage($chatId, $message, $replyMarkup = null) {
     }
 }
 
+function answerCallbackQuery($callbackQueryId, $text = null) {
+    global $apiURL;
+    $client = new Client();
+    $url = $apiURL . "answerCallbackQuery";
+    $params = ['callback_query_id' => $callbackQueryId];
+    if ($text) {
+        $params['text'] = $text;
+    }
+    $client->request('POST', $url, ['form_params' => $params]);
+}
+
 function getLastUpdateId($pdo) {
     $stmt = $pdo->query("SELECT update_id FROM last_update_id ORDER BY id DESC LIMIT 1");
     $result = $stmt->fetch(PDO::FETCH_ASSOC);
@@ -103,124 +114,219 @@ function saveTest($pdo, $data) {
     }
 }
 
+function getTests($pdo) {
+    $stmt = $pdo->query("SELECT test_id, test_name FROM tests ORDER BY created_at DESC");
+    return $stmt->fetchAll(PDO::FETCH_ASSOC);
+}
+
+function getTestQuestions($pdo, $testId) {
+    $stmt = $pdo->prepare("SELECT question_id, question_text, correct_answer FROM questions WHERE test_id = :test_id ORDER BY question_id");
+    $stmt->execute(['test_id' => $testId]);
+    return $stmt->fetchAll(PDO::FETCH_ASSOC);
+}
+
+function getQuestionAnswers($pdo, $questionId) {
+    $stmt = $pdo->prepare("SELECT answer_id, answer_text FROM answers WHERE question_id = :question_id ORDER BY answer_id");
+    $stmt->execute(['question_id' => $questionId]);
+    return $stmt->fetchAll(PDO::FETCH_ASSOC);
+}
+
+function sendQuestion($chatId, $question, $questionIndex) {
+    $answers = $question['answers'];
+    $keyboard = ['inline_keyboard' => []];
+    foreach ($answers as $index => $answer) {
+        $keyboard['inline_keyboard'][] = [['text' => $answer['answer_text'], 'callback_data' => 'answer_' . $index]];
+    }
+    $message = "Question " . ($questionIndex + 1) . ": " . $question['question_text'];
+    sendMessage($chatId, $message, $keyboard);
+}
+
 $lastUpdateId = getLastUpdateId($pdo);
 
 while (true) {
     $updates = getUpdates($lastUpdateId + 1);
     if (isset($updates['ok']) && $updates['ok'] === true && isset($updates['result'])) {
         foreach ($updates['result'] as $update) {
-            $chatId = $update['message']['chat']['id'];
-            $text = $update['message']['text'] ?? '';
+            if (isset($update['callback_query'])) {
+                $callbackQuery = $update['callback_query'];
+                $callbackQueryId = $callbackQuery['id'];
+                $chatId = $callbackQuery['message']['chat']['id'];
+                $data = $callbackQuery['data'];
 
-            $userState = getUserState($pdo, $chatId);
-
-            switch ($userState['state']) {
-                case 'creating_test':
-                    if ($text === 'Confirm Name') {
-                        sendMessage($chatId, "Please enter the first question:");
-                        setUserState($pdo, $chatId, 'entering_question', $userState['data']);
-                    } else {
-                        $data = $userState['data'] ?? [];
-                        $data['test_name'] = $text;
-                        sendMessage($chatId, "Test name set to \"$text\". Click \"Confirm Name\" to proceed.", [
-                            'keyboard' => [[['text' => 'Confirm Name']]],
-                            'resize_keyboard' => true,
-                            'one_time_keyboard' => true
-                        ]);
-                        setUserState($pdo, $chatId, 'creating_test', $data);
+                if (strpos($data, 'take_test_') === 0) {
+                    $testId = str_replace('take_test_', '', $data);
+                    $questions = getTestQuestions($pdo, $testId);
+                    foreach ($questions as &$question) {
+                        $question['answers'] = getQuestionAnswers($pdo, $question['question_id']);
                     }
-                    break;
+                    unset($question);  // Remove reference to last element
 
-                case 'entering_question':
-                    if ($text === 'Confirm Question') {
-                        sendMessage($chatId, "Please enter the four answer options separated by commas:");
-                        setUserState($pdo, $chatId, 'entering_answers', $userState['data']);
+                    setUserState($pdo, $chatId, 'taking_test', ['current_question' => 0, 'questions' => $questions, 'responses' => []]);
+                    $question = $questions[0];
+                    sendQuestion($chatId, $question, 0);
+                }
+
+                if (strpos($data, 'answer_') === 0) {
+                    $answerIndex = str_replace('answer_', '', $data);
+                    $userState = getUserState($pdo, $chatId);
+                    $userResponses = $userState['data']['responses'];
+                    $currentQuestionIndex = $userState['data']['current_question'];
+                
+                    // Guardar la respuesta del usuario
+                    $userResponses[$currentQuestionIndex] = intval($answerIndex);
+                    setUserState($pdo, $chatId, 'taking_test', ['current_question' => $currentQuestionIndex + 1, 'responses' => $userResponses]);
+                
+                    // Verificar si hay más preguntas por enviar
+                    if ($currentQuestionIndex + 1 < count($userState['data']['questions'])) {
+                        $nextQuestion = $userState['data']['questions'][$currentQuestionIndex + 1];
+                        sendQuestion($chatId, $nextQuestion, $currentQuestionIndex + 1);
                     } else {
-                        $data = $userState['data'] ?? [];
-                        $data['questions'][] = ['question' => $text, 'answers' => []];
-                        sendMessage($chatId, "Question set to \"$text\". Click \"Confirm Question\" to proceed.", [
-                            'keyboard' => [[['text' => 'Confirm Question']]],
-                            'resize_keyboard' => true,
-                            'one_time_keyboard' => true
-                        ]);
-                        setUserState($pdo, $chatId, 'entering_question', $data);
+                        // Si no hay más preguntas, calcular los resultados del test
+                        $correctAnswers = 0;
+                        foreach ($userResponses as $index => $response) {
+                            if ($response === $userState['data']['questions'][$index]['correct_answer']) {
+                                $correctAnswers++;
+                            }
+                        }
+                        $totalQuestions = count($userState['data']['questions']);
+                        sendMessage($chatId, "Test completed! You got $correctAnswers out of $totalQuestions correct.");
+                        clearUserState($pdo, $chatId);
                     }
-                    break;
+                
+                    // Responder la callback query
+                    answerCallbackQuery($callbackQueryId);
+                }
+                
+            } else {
+                $chatId = $update['message']['chat']['id'];
+                $text = $update['message']['text'] ?? '';
 
-                case 'entering_answers':
-                    if ($text === 'Confirm Answers') {
-                        sendMessage($chatId, "Please indicate the correct answer (1, 2, 3, or 4):");
-                        setUserState($pdo, $chatId, 'entering_correct_answer', $userState['data']);
-                    } else {
-                        $answers = explode(',', $text);
-                        if (count($answers) === 4) {
-                            $data = $userState['data'];
-                            $lastIndex = count($data['questions']) - 1;
-                            $data['questions'][$lastIndex]['answers'] = array_map('trim', $answers);
-                            sendMessage($chatId, "Answers set. Click \"Confirm Answers\" to proceed.", [
-                                'keyboard' => [[['text' => 'Confirm Answers']]],
+                $userState = getUserState($pdo, $chatId);
+
+                switch ($userState['state']) {
+                    case 'creating_test':
+                        if ($text === 'Confirm Name') {
+                            sendMessage($chatId, "Please enter the first question:");
+                            setUserState($pdo, $chatId, 'entering_question', $userState['data']);
+                        } else {
+                            $data = $userState['data'] ?? [];
+                            $data['test_name'] = $text;
+                            sendMessage($chatId, "Test name set to \"$text\". Click \"Confirm Name\" to proceed.", [
+                                'keyboard' => [[['text' => 'Confirm Name']]],
                                 'resize_keyboard' => true,
                                 'one_time_keyboard' => true
                             ]);
-                            setUserState($pdo, $chatId, 'entering_answers', $data);
-                        } else {
-                            sendMessage($chatId, "Please enter exactly four answers separated by commas.");
+                            setUserState($pdo, $chatId, 'creating_test', $data);
                         }
-                    }
-                    break;
+                        break;
 
-                case 'entering_correct_answer':
-                    if (in_array($text, ['1', '2', '3', '4'])) {
-                        $data = $userState['data'];
-                        $lastIndex = count($data['questions']) - 1;
-                        $data['questions'][$lastIndex]['correct'] = intval($text) - 1;
-                        sendMessage($chatId, "Correct answer set. Do you want to add another question or finish the test?", [
-                            'keyboard' => [
-                                [['text' => 'Next Question'], ['text' => 'Finish Test']]
-                            ],
-                            'resize_keyboard' => true,
-                            'one_time_keyboard' => true
-                        ]);
-                        setUserState($pdo, $chatId, 'confirm_next_or_finish', $data);
-                    } else {
-                        sendMessage($chatId, "Please indicate the correct answer (1, 2, 3, or 4):");
-                    }
-                    break;
+                    case 'entering_question':
+                        if ($text === 'Confirm Question') {
+                            sendMessage($chatId, "Please enter the four answer options separated by commas:");
+                            setUserState($pdo, $chatId, 'entering_answers', $userState['data']);
+                        } else {
+                            $data = $userState['data'] ?? [];
+                            $data['questions'][] = ['question' => $text, 'answers' => []];
+                            sendMessage($chatId, "Question set to \"$text\". Click \"Confirm Question\" to proceed.", [
+                                'keyboard' => [[['text' => 'Confirm Question']]],
+                                'resize_keyboard' => true,
+                                'one_time_keyboard' => true
+                            ]);
+                            setUserState($pdo, $chatId, 'entering_question', $data);
+                        }
+                        break;
 
-                case 'confirm_next_or_finish':
-                    if ($text === 'Next Question') {
-                        sendMessage($chatId, "Please enter the next question:");
-                        setUserState($pdo, $chatId, 'entering_question', $userState['data']);
-                    } elseif ($text === 'Finish Test') {
-                        saveTest($pdo, $userState['data']);
-                        clearUserState($pdo, $chatId);
-                        sendMessage($chatId, "Test saved successfully!");
-                    }
-                    break;
+                    case 'entering_answers':
+                        if ($text === 'Confirm Answers') {
+                            sendMessage($chatId, "Please indicate the correct answer (1, 2, 3, or 4):");
+                            setUserState($pdo, $chatId, 'entering_correct_answer', $userState['data']);
+                        } else {
+                            $answers = explode(',', $text);
+                            if (count($answers) === 4) {
+                                $data = $userState['data'];
+                                $lastIndex = count($data['questions']) - 1;
+                                $data['questions'][$lastIndex]['answers'] = array_map('trim', $answers);
+                                sendMessage($chatId, "Answers set. Click \"Confirm Answers\" to proceed.", [
+                                    'keyboard' => [[['text' => 'Confirm Answers']]],
+                                    'resize_keyboard' => true,
+                                    'one_time_keyboard' => true
+                                ]);
+                                setUserState($pdo, $chatId, 'entering_answers', $data);
+                            } else {
+                                sendMessage($chatId, "Please enter exactly four answers separated by commas.");
+                            }
+                        }
+                        break;
 
-                default:
-                    if ($text === '/menu') {
-                        $keyboard = [
-                            'keyboard' => [
-                                [['text' => 'Create Test'], ['text' => 'Show Tests']]
-                            ],
-                            'resize_keyboard' => true,
-                            'one_time_keyboard' => true
-                        ];
-                        sendMessage($chatId, "Please choose an option:\n1. Create Test\n2. Show Tests", $keyboard);
-                    } elseif ($text === 'Create Test') {
-                        sendMessage($chatId, "Please enter the name of the test:");
-                        setUserState($pdo, $chatId, 'creating_test');
-                    } elseif ($text === 'Show Tests') {
-                        // Implement logic to show tests
-                        sendMessage($chatId, "Here are the available tests:");
-                        // You need to implement the code to retrieve and display the tests from your database
-                    }
-                    break;
+                    case 'entering_correct_answer':
+                        if (in_array($text, ['1', '2', '3', '4'])) {
+                            $data = $userState['data'];
+                            $lastIndex = count($data['questions']) - 1;
+                            $data['questions'][$lastIndex]['correct'] = intval($text) - 1;
+                            sendMessage($chatId, "Correct answer set. Do you want to add another question or finish the test?", [
+                                'keyboard' => [
+                                    [['text' => 'Next Question'], ['text' => 'Finish Test']]
+                                ],
+                                'resize_keyboard' => true,
+                                'one_time_keyboard' => true
+                            ]);
+                            setUserState($pdo, $chatId, 'confirm_next_or_finish', $data);
+                        } else {
+                            sendMessage($chatId, "Please indicate the correct answer (1, 2, 3, or 4):");
+                        }
+                        break;
+
+                    case 'confirm_next_or_finish':
+                        if ($text === 'Next Question') {
+                            sendMessage($chatId, "Please enter the next question:");
+                            setUserState($pdo, $chatId, 'entering_question', $userState['data']);
+                        } elseif ($text === 'Finish Test') {
+                            saveTest($pdo, $userState['data']);
+                            clearUserState($pdo, $chatId);
+                            sendMessage($chatId, "Test saved successfully!");
+                            sendMessage($chatId, "Returning to menu...");
+                            $keyboard = [
+                                'keyboard' => [
+                                    [['text' => 'Create Test'], ['text' => 'Show Tests']]
+                                ],
+                                'resize_keyboard' => true,
+                                'one_time_keyboard' => true
+                            ];
+                            sendMessage($chatId, "Please choose an option:\n1. Create Test\n2. Show Tests", $keyboard);
+                        }
+                        break;
+
+                    default:
+                        if ($text === '/menu') {
+                            $keyboard = [
+                                'keyboard' => [
+                                    [['text' => 'Create Test'], ['text' => 'Show Tests']]
+                                ],
+                                'resize_keyboard' => true,
+                                'one_time_keyboard' => true
+                            ];
+                            sendMessage($chatId, "Please choose an option:\n1. Create Test\n2. Show Tests", $keyboard);
+                        } elseif ($text === 'Create Test') {
+                            sendMessage($chatId, "Please enter the name of the test:");
+                            setUserState($pdo, $chatId, 'creating_test');
+                        } elseif ($text === 'Show Tests') {
+                            $tests = getTests($pdo);
+                            if (!empty($tests)) {
+                                $keyboard = ['inline_keyboard' => []];
+                                foreach ($tests as $test) {
+                                    $keyboard['inline_keyboard'][] = [['text' => $test['test_name'], 'callback_data' => 'take_test_' . $test['test_id']]];
+                                }
+                                sendMessage($chatId, "Here are the available tests:", $keyboard);
+                            } else {
+                                sendMessage($chatId, "No tests available.");
+                            }
+                        }
+                        break;
+                }
+
+                $lastUpdateId = $update['update_id'];
+                setLastUpdateId($pdo, $lastUpdateId);
             }
-
-            $lastUpdateId = $update['update_id'];
-            setLastUpdateId($pdo, $lastUpdateId);
         }
     } else {
         error_log("Error fetching updates: " . print_r($updates, true));
